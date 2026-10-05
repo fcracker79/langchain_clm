@@ -49,3 +49,36 @@ class MyProvider:
 
 The CLM heads were trained on Qwen3-8B embeddings (4096 dims, last-token pooling), so a custom
 provider must serve the same encoder; a dimension mismatch raises a `ValueError`.
+
+## Example: Wumpus World
+
+`examples/wumpus.py` solves the Wumpus World with a LangGraph graph in which CLM takes the
+decisions. It needs the llama embedding server running (see above).
+
+```bash
+uv run python examples/wumpus.py              # the classic 4x4 world
+uv run python examples/wumpus.py --random     # a random world
+uv run python examples/wumpus.py --seed 7     # a reproducible random world (implies --random)
+```
+
+The map is printed first (`S` start, `P` pit, `W` wumpus, `G` gold), then the agent's
+observations and actions, and finally the outcome and score.
+
+How it works:
+
+- An `observe` node updates what the agent knows from the percepts (breeze, stench, glitter) and
+  describes the situation in plain English.
+- `create_router` gives that text to CLM, which chooses between three intents: *explore*, *grab
+  the gold* or *leave*. The router returns the node that carries the intent out.
+- Those nodes do the path-finding over the cells the agent has proven safe, so it never steps on
+  a pit or on the wumpus.
+
+Two things to know:
+
+- CLM is a semantic matcher and does not tell "turn left" from "turn right" (nor north from
+  east). That is why it picks high-level intents and the nodes handle navigation.
+- The agent never takes risks and never shoots. Random worlds are filtered so that the gold can
+  be reached through cells proven safe.
+
+The wording of the situation text and of the route descriptions affects which route CLM picks;
+the ones in the example were tuned against the model, so re-check them if you change them.
