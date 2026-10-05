@@ -90,29 +90,34 @@ class CLM:
         self,
         embedding_provider: EmbeddingProvider,
         checkpoint_path: str | os.PathLike[str] | None = None,
+        device: str | torch.device = "cpu",
     ) -> None:
+        """`device` is where the projection heads run (e.g. "cpu", "cuda", "cuda:1", "mps")."""
+        self._device = torch.device(device)
         checkpoint = torch.load(
-            resolve_checkpoint(checkpoint_path), map_location="cpu", weights_only=True
+            resolve_checkpoint(checkpoint_path), map_location=self._device, weights_only=True
         )
         cfg = checkpoint["cfg"]
 
-        self._state_head = self._load_head(cfg, checkpoint["state_head"])
-        self._action_head = self._load_head(cfg, checkpoint["action_head"])
+        self._state_head = self._load_head(cfg, checkpoint["state_head"], self._device)
+        self._action_head = self._load_head(cfg, checkpoint["action_head"], self._device)
         self._logit_scale = float(
-            torch.as_tensor(checkpoint["logit_scale"]).float().exp().clamp(max=100.0)
+            torch.as_tensor(checkpoint["logit_scale"]).float().exp().clamp(max=100.0).cpu()
         )
         self._embeddings = embedding_provider
         self._hidden_size = int(cfg["hidden_size"])
         self._action_cache: dict[tuple[str, ...], torch.Tensor] = {}
 
     @staticmethod
-    def _load_head(cfg: dict[str, typing.Any], state: dict[str, torch.Tensor]) -> _Head:
+    def _load_head(
+        cfg: dict[str, typing.Any], state: dict[str, torch.Tensor], device: torch.device
+    ) -> _Head:
         head = _Head(cfg)
         head.load_state_dict(state)
-        return head.eval()
+        return head.to(device).eval()
 
     def _embed(self, texts: list[str]) -> torch.Tensor:
-        x = torch.tensor(self._embeddings.embed(texts), dtype=torch.float32)
+        x = torch.tensor(self._embeddings.embed(texts), dtype=torch.float32, device=self._device)
         if x.shape[-1] != self._hidden_size:
             raise ValueError(
                 f"Embedding provider returned {x.shape[-1]}-dim vectors, but the CLM "

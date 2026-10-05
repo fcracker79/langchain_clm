@@ -3,6 +3,8 @@ import enum
 import os
 import typing
 
+import torch
+
 from clm.embedding_provider import EmbeddingProvider, LlamaEmbeddingProvider
 from clm.model import CLM
 
@@ -25,11 +27,13 @@ def create_router(
     routes: typing.Sequence[Route[E]],
     embedding_provider: EmbeddingProvider | None = None,
     checkpoint_path: str | os.PathLike[str] | None = None,
+    device: str | torch.device = "cpu",
 ) -> typing.Callable[[S], str]:
     """Build a function usable with `StateGraph.add_conditional_edges`.
 
     The returned callable extracts the text from the graph state, asks CLM which route
     description fits best, and returns the name of the corresponding graph node.
+    `device` is where the CLM projection heads run ("cpu", "cuda", "cuda:1", "mps", ...).
     """
     if not routes:
         raise ValueError("routes must not be empty")
@@ -41,7 +45,7 @@ def create_router(
     values = [r.value for r in routes]
 
     # Fail fast on a missing checkpoint; the embedding server is only contacted on first use.
-    clm = CLM(embedding_provider or LlamaEmbeddingProvider(), checkpoint_path)
+    clm = CLM(embedding_provider or LlamaEmbeddingProvider(), checkpoint_path, device)
 
     def route(state: S) -> str:
         selected = values[clm.select(state_selector(state), descriptions)]

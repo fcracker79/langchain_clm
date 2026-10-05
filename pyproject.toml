@@ -24,3 +24,8 @@ line-length = 100
 [tool.mypy]
 python_version = "3.13"
 strict = true
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
