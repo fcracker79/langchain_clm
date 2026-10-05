@@ -9,11 +9,13 @@ CLM is a semantic matcher: it tells "the gold is here" from "keep searching" rel
 not tell "turn left" from "turn right". So it chooses high-level intents, and the nodes do the
 path-finding over the cells the agent has deduced to be safe.
 
-Requires the llama embedding server (see README). Run with:  uv run python examples/wumpus.py
+Requires the llama embedding server (see README). Run with:  uv run python examples/wumpus.py [--random [--seed N]]
 """
 
+import argparse
 import dataclasses
 import enum
+import random
 import typing
 
 from langgraph.graph import END, START, StateGraph
@@ -142,6 +144,50 @@ def describe(world: World, known: Knowledge) -> str:
     return text + " I still have not found the gold, and there are cells I have not searched yet."
 
 
+# --- World generation ---------------------------------------------------------------------------
+
+PIT_PROBABILITY = 0.2
+
+
+def classic_world() -> World:
+    return World(pits={(2, 0), (2, 2), (3, 3)}, wumpus=(0, 2), gold=(1, 2))
+
+
+def is_solvable(world: World) -> bool:
+    """Whether exploring only cells proven safe is enough to reach the gold.
+
+    The agent never takes risks, so on a world where the gold is behind an undecidable cell it
+    would just leave empty-handed. Random worlds are filtered with this check.
+    """
+    probe = dataclasses.replace(world, pits=set(world.pits))
+    known: Knowledge = {}
+    while True:
+        known[probe.pos] = probe.percepts()
+        path = unexplored_path(probe, known)
+        if not path:
+            return world.gold in known
+        probe.walk(path)
+
+
+def random_world(rng: random.Random) -> World:
+    """A random world where the start is hazard-free and the gold is safely reachable."""
+    cells = [(x, y) for x in range(SIZE) for y in range(SIZE) if (x, y) != (0, 0)]
+    while True:
+        wumpus, gold = rng.choice(cells), rng.choice(cells)
+        pits = {c for c in cells if c != wumpus and rng.random() < PIT_PROBABILITY}
+        world = World(pits=pits - {gold}, wumpus=wumpus, gold=gold)
+        if is_solvable(world):
+            return world
+
+
+def render(world: World) -> str:
+    symbols = {c: "P" for c in world.pits} | {world.wumpus: "W", world.gold: "G", (0, 0): "S"}
+    rows = [
+        " ".join(symbols.get((x, y), ".") for x in range(SIZE)) for y in reversed(range(SIZE))
+    ]
+    return "\n".join(rows) + "\n(S start, P pit, W wumpus, G gold; y grows upwards)"
+
+
 # --- Graph --------------------------------------------------------------------------------------
 
 
@@ -209,7 +255,16 @@ def build_graph() -> typing.Any:
 
 
 def main() -> None:
-    world = World(pits={(2, 0), (2, 2), (3, 3)}, wumpus=(0, 2), gold=(1, 2))
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--random", action="store_true", help="use a random world")
+    parser.add_argument("--seed", type=int, help="seed for the random world (implies --random)")
+    args = parser.parse_args()
+
+    if args.random or args.seed is not None:
+        world = random_world(random.Random(args.seed))
+    else:
+        world = classic_world()
+    print(render(world), end="\n\n")
     result = build_graph().invoke(
         {"world": world, "known": {}, "situation": "", "log": []},
         {"recursion_limit": 200},
