@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "langchain-clm"
 version = "0.1.0"
-description = "Add your description here"
+description = "Route LangGraph graphs with a CLM (Contrastive Language Model): pick the next node by matching the state against route descriptions."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
