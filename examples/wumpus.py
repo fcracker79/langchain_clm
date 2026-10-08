@@ -31,6 +31,8 @@ SIZE = 4
 MAX_STEPS = 100
 HEADINGS = [(1, 0), (0, 1), (-1, 0), (0, -1)]  # east, north, west, south (turn left = +1)
 
+FACING = ["east", "north", "west", "south"]
+
 Cell = tuple[int, int]
 Knowledge = dict[Cell, frozenset[str]]  # visited cell -> percepts felt there
 
@@ -427,7 +429,7 @@ class App:
         w = self.world
         self.agent_var.set(
             f"status    {status}\n"
-            f"position  {w.pos}\n"
+            f"position  {w.pos}, facing {FACING[w.heading]}\n"
             f"gold      {'in the bag' if w.has_gold else 'not yet'}\n"
             f"steps     {w.steps}\n"
             f"score     {w.score}"
@@ -462,46 +464,103 @@ class App:
                     )
 
         for pit in w.pits:
-            cx, cy = self._center(pit)
-            c.create_oval(cx - 34, cy - 34, cx + 34, cy + 34, fill="#05070a", outline="#3a4256")
-            c.create_oval(cx - 20, cy - 20, cx + 20, cy + 20, fill="#000", outline="")
-            c.create_text(cx, cy - 46 + 8, text="PIT", fill=MUTED, font=("", 8, "bold"))
-
-        cx, cy = self._center(w.wumpus)
-        c.create_polygon(
-            cx - 36, cy + 30, cx, cy - 36, cx + 36, cy + 30, fill=DANGER, outline="#ff8a8d", width=2
-        )
-        c.create_text(cx, cy + 8, text="W", fill="white", font=("DejaVu Sans", 22, "bold"))
-
+            self._draw_pit(*self._center(pit))
+        self._draw_wumpus(*self._center(w.wumpus))
         if not w.has_gold:
-            cx, cy = self._center(w.gold)
-            c.create_polygon(
-                cx, cy - 40, cx + 40, cy, cx, cy + 40, cx - 40, cy, fill=GOLD, outline="#fff1b8"
-            )
-
-        self._draw_agent()
+            self._draw_gold(*self._center(w.gold))
+        self._draw_agent(*self._center(w.pos))
 
     def _center(self, cell: tuple[int, int]) -> tuple[int, int]:
         x0, y0, x1, y1 = self._cell_box(cell)
         return (x0 + x1) // 2, (y0 + y1) // 2
 
-    def _draw_agent(self) -> None:
-        w, c = self.world, self.canvas
-        cx, cy = self._center(w.pos)
-        color = DANGER if not w.alive else AGENT
-        c.create_oval(cx - 22, cy - 22, cx + 22, cy + 22, fill=color, outline="white", width=2)
-        dx, dy = HEADINGS[w.heading]
-        dy = -dy  # screen y grows downwards
-        c.create_polygon(
-            cx + dx * 22 - dy * 8, cy + dy * 22 + dx * 8,
-            cx + dx * 22 + dy * 8, cy + dy * 22 - dx * 8,
-            cx + dx * 34, cy + dy * 34,
-            fill="white",
-        )  # fmt: skip
-        if w.has_gold:
+    def _draw_pit(self, cx: int, cy: int) -> None:
+        c = self.canvas
+        c.create_oval(cx - 50, cy - 12, cx + 50, cy + 38, fill="#4a4036", outline="#2b251f", width=2)
+        c.create_oval(cx - 42, cy - 6, cx + 42, cy + 32, fill="#0a0806", outline="")
+        base = cy + 22
+        for dx, height in ((-30, 24), (30, 26), (-15, 36), (15, 38), (0, 30)):
+            x = cx + dx
+            c.create_polygon(x - 7, base, x, base - height, x, base, fill="#e8ecf3", outline="")
+            c.create_polygon(x, base, x, base - height, x + 7, base, fill="#8b94a8", outline="")
+
+    def _draw_wumpus(self, cx: int, cy: int) -> None:
+        c = self.canvas
+        for sign in (-1, 1):
             c.create_polygon(
-                cx, cy - 10, cx + 10, cy, cx, cy + 10, cx - 10, cy, fill=GOLD, outline=""
+                cx + sign * 26, cy - 18, cx + sign * 34, cy - 44, cx + sign * 12, cy - 28,
+                fill="#f2e6c9", outline="#a89870", width=2,
+            )  # fmt: skip
+            c.create_oval(
+                cx + sign * 28 - 10, cy + 30, cx + sign * 28 + 10, cy + 44,
+                fill="#6a38b5", outline="#4b2a85", width=2,
+            )  # fmt: skip
+        c.create_oval(cx - 38, cy - 32, cx + 38, cy + 36, fill="#7a46c9", outline="#4b2a85", width=3)
+        for sign in (-1, 1):
+            c.create_oval(cx + sign * 14 - 9, cy - 19, cx + sign * 14 + 9, cy - 1, fill="white")
+            c.create_oval(
+                cx + sign * 14 - sign * 2 - 4, cy - 14, cx + sign * 14 - sign * 2 + 4, cy - 6,
+                fill=DANGER, outline="",
+            )  # fmt: skip
+            c.create_line(
+                cx + sign * 24, cy - 24, cx + sign * 6, cy - 16, fill="#1c0f33", width=3
+            )  # angry brow
+        c.create_oval(cx - 24, cy + 6, cx + 24, cy + 28, fill="#2a0f1f", outline="#1c0f33", width=2)
+        for x in (-12, -4, 4):
+            c.create_polygon(cx + x, cy + 8, cx + x + 8, cy + 8, cx + x + 4, cy + 17, fill="white")
+        for x in (-9, 1):
+            c.create_polygon(cx + x, cy + 27, cx + x + 8, cy + 27, cx + x + 4, cy + 20, fill="white")
+
+    def _draw_gold(self, cx: int, cy: int) -> None:
+        c = self.canvas
+        rows = ((30, (-30, -10, 10, 30)), (21, (-20, 0, 20)), (12, (-10, 10)), (3, (0,)))
+        for y, xs in rows:
+            for x in xs:
+                c.create_oval(
+                    cx + x - 15, cy + y - 8, cx + x + 15, cy + y + 8,
+                    fill=GOLD, outline="#a87a00", width=2,
+                )  # fmt: skip
+                c.create_oval(cx + x - 9, cy + y - 4, cx + x + 9, cy + y + 4, outline="#d9a400")
+        c.create_text(cx, cy + 3, text="$", fill="#a87a00", font=("DejaVu Sans", 8, "bold"))
+        for sx, sy in ((-34, 0), (34, 8), (14, -14)):  # sparkles
+            c.create_polygon(
+                cx + sx, cy + sy - 8, cx + sx + 2, cy + sy - 2, cx + sx + 8, cy + sy,
+                cx + sx + 2, cy + sy + 2, cx + sx, cy + sy + 8, cx + sx - 2, cy + sy + 2,
+                cx + sx - 8, cy + sy, cx + sx - 2, cy + sy - 2, fill="#fff6c9", outline="",
+            )  # fmt: skip
+
+    def _draw_agent(self, cx: int, cy: int) -> None:
+        c, w = self.canvas, self.world
+        dead = not w.alive
+        jacket = DANGER if dead else "#b5713a"
+        for sign in (-1, 1):
+            c.create_line(
+                cx + sign * 13, cy + 4, cx + sign * 22, cy + 18,
+                fill=jacket, width=5, capstyle=tk.ROUND,
+            )  # fmt: skip
+            c.create_rectangle(cx + sign * 6 - 3, cy + 18, cx + sign * 6 + 3, cy + 36, fill="#3b4a68")
+            c.create_oval(
+                cx + sign * 7 - 7, cy + 34, cx + sign * 7 + 7, cy + 41, fill="#2f1d0e", outline=""
+            )  # fmt: skip
+        c.create_oval(cx - 14, cy - 2, cx + 14, cy + 24, fill=jacket, outline="#6b4423", width=2)
+        c.create_oval(cx - 14, cy - 26, cx + 14, cy + 2, fill="#f1c27d", outline="#a9784a", width=2)
+        if dead:
+            for sign in (-1, 1):
+                x = cx + sign * 5
+                c.create_line(x - 3, cy - 15, x + 3, cy - 9, fill="black", width=2)
+                c.create_line(x - 3, cy - 9, x + 3, cy - 15, fill="black", width=2)
+        else:
+            for sign in (-1, 1):
+                c.create_oval(cx + sign * 5 - 2, cy - 14, cx + sign * 5 + 2, cy - 10, fill="black")
+            c.create_arc(
+                cx - 7, cy - 14, cx + 7, cy - 2, start=210, extent=120, style=tk.ARC, width=2
             )
+        c.create_oval(cx - 15, cy - 46, cx + 15, cy - 26, fill="#7a4f2a", outline="#2f1d0e", width=2)
+        c.create_line(cx - 6, cy - 45, cx, cy - 41, cx + 6, cy - 45, fill="#2f1d0e", width=2)
+        c.create_rectangle(cx - 14, cy - 34, cx + 14, cy - 28, fill="#2f1d0e", outline="")
+        c.create_oval(cx - 28, cy - 33, cx + 28, cy - 21, fill="#5c3a1e", outline="#2f1d0e", width=2)
+        if w.has_gold:
+            c.create_oval(cx + 17, cy + 13, cx + 31, cy + 25, fill=GOLD, outline="#a87a00", width=2)
 
     def _draw_bars(self, probs: dict[str, float], chosen: str | None) -> None:
         b = self.bars
