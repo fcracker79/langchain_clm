@@ -9,18 +9,23 @@ CLM is a semantic matcher: it tells "the gold is here" from "keep searching" rel
 not tell "turn left" from "turn right". So it chooses high-level intents, and the nodes do the
 path-finding over the cells the agent has deduced to be safe.
 
-Requires the llama embedding server (see README). Run with:  uv run python examples/wumpus.py [--random [--seed N]]
+Requires the llama embedding server (see README). Run with:
+    uv run python examples/wumpus.py [--random [--seed N]] [--gui [--delay SECONDS]]
 """
 
 import argparse
 import dataclasses
 import enum
+import queue
 import random
+import threading
+import time
 import typing
 
 from langgraph.graph import END, START, StateGraph
 
 from clm import Route, create_router
+from clm.embedding_provider import EmbeddingProvider, LlamaEmbeddingProvider
 
 SIZE = 4
 MAX_STEPS = 100
@@ -234,9 +239,17 @@ ROUTES = [
 ]
 
 
-def build_graph() -> typing.Any:
+def build_graph(
+    on_decision: typing.Callable[[str, dict[Intent, float]], None] | None = None,
+    embedding_provider: EmbeddingProvider | None = None,
+) -> typing.Any:
     # Default embedding provider: llama server with Qwen3-8B on :8090.
-    router = create_router(state_selector=lambda s: s["situation"], routes=ROUTES)
+    router = create_router(
+        state_selector=lambda s: s["situation"],
+        routes=ROUTES,
+        embedding_provider=embedding_provider,
+        on_decision=on_decision,
+    )
 
     def route_or_stop(state: State) -> str:
         world = state["world"]
@@ -254,16 +267,389 @@ def build_graph() -> typing.Any:
     return graph.compile()
 
 
+# --- GUI ----------------------------------------------------------------------------------------
+#
+# The graph runs in a worker thread and posts events to a queue; the Tk main loop drains the queue
+# and redraws. Besides the board it shows what CLM answered at each step (probability of every
+# intent) and how long each decision took, split between the embedding server and the CLM heads.
+
+tk: typing.Any  # the tkinter module, imported by run_gui
+
+CELL = 128
+MARGIN = 34
+PANEL_WIDTH = 520
+
+BG = "#12151c"
+PANEL_BG = "#1a1f2b"
+CELL_BG = "#232a38"
+VISITED_BG = "#2f3a50"
+TEXT = "#e6e9ef"
+MUTED = "#8a93a6"
+ACCENT = "#4cc38a"
+BAR = "#3b4a68"
+GOLD = "#f5c542"
+DANGER = "#e5484d"
+AGENT = "#4c9aff"
+
+FONT = ("DejaVu Sans", 11)
+MONO = ("DejaVu Sans Mono", 10)
+
+
+class TimedProvider:
+    """Wraps an embedding provider to measure how much of a decision is spent in the server."""
+
+    def __init__(self, inner: EmbeddingProvider) -> None:
+        self._inner = inner
+        self.reset()
+
+    def reset(self) -> None:
+        self.first_call_at: float | None = None
+        self.embed_seconds = 0.0
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        start = time.perf_counter()
+        if self.first_call_at is None:
+            self.first_call_at = start
+        try:
+            return self._inner.embed(texts)
+        finally:
+            self.embed_seconds += time.perf_counter() - start
+
+
+class App:
+    def __init__(self, world: World, delay: float) -> None:
+        self.initial = world
+        self.delay = delay
+        self.graph: typing.Any = None
+        self.events: queue.Queue[tuple[str, dict[str, typing.Any]]] = queue.Queue()
+        self.timer = TimedProvider(LlamaEmbeddingProvider())
+        self.running = False
+
+        self.world = self._copy(world)
+        self.known: dict[tuple[int, int], frozenset[str]] = {}
+        self.latencies: list[float] = []
+
+        self.root = tk.Tk()
+        self.root.title("Wumpus World · CLM")
+        self.root.configure(bg=BG)
+        self._build_ui()
+        self._reset_panel()
+        self._draw_board()
+        self.root.after(40, self._poll)
+
+    # --- UI ---------------------------------------------------------------------------------
+
+    def _build_ui(self) -> None:
+        board_side = SIZE * CELL + 2 * MARGIN
+        left = tk.Frame(self.root, bg=BG)
+        left.pack(side=tk.LEFT, padx=18, pady=18)
+        self.canvas = tk.Canvas(
+            left, width=board_side, height=board_side, bg=BG, highlightthickness=0
+        )
+        self.canvas.pack()
+        self.button = tk.Button(
+            left,
+            text="▶  Start",
+            command=self.start,
+            font=("DejaVu Sans", 15, "bold"),
+            bg=ACCENT,
+            fg="#0b1f15",
+            activebackground="#6fd9a6",
+            relief=tk.FLAT,
+            padx=30,
+            pady=8,
+            cursor="hand2",
+        )
+        self.button.pack(pady=(14, 0))
+
+        panel = tk.Frame(self.root, bg=PANEL_BG, width=PANEL_WIDTH)
+        panel.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 18), pady=18)
+        panel.pack_propagate(False)
+
+        self._heading(panel, "CLM decision")
+        self.bars = tk.Canvas(panel, width=PANEL_WIDTH - 40, height=108, bg=PANEL_BG, bd=0)
+        self.bars.configure(highlightthickness=0)
+        self.bars.pack(padx=20)
+
+        self._heading(panel, "Timings")
+        self.timing_var = tk.StringVar()
+        tk.Label(
+            panel, textvariable=self.timing_var, font=MONO, fg=TEXT, bg=PANEL_BG, justify=tk.LEFT
+        ).pack(anchor=tk.W, padx=20)
+
+        self._heading(panel, "Agent")
+        self.agent_var = tk.StringVar()
+        tk.Label(
+            panel, textvariable=self.agent_var, font=MONO, fg=TEXT, bg=PANEL_BG, justify=tk.LEFT
+        ).pack(anchor=tk.W, padx=20)
+
+        self._heading(panel, "Log")
+        log_frame = tk.Frame(panel, bg=PANEL_BG)
+        log_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=(0, 20))
+        self.log = tk.Text(
+            log_frame,
+            font=MONO,
+            bg=CELL_BG,
+            fg=TEXT,
+            wrap=tk.WORD,
+            relief=tk.FLAT,
+            state=tk.DISABLED,
+            padx=8,
+            pady=6,
+        )
+        self.log.pack(fill=tk.BOTH, expand=True)
+        self.log.tag_configure("situation", foreground=MUTED)
+        self.log.tag_configure("decision", foreground=ACCENT)
+        self.log.tag_configure("action", foreground=TEXT)
+        self.log.tag_configure("error", foreground=DANGER)
+
+    def _heading(self, parent: typing.Any, text: str) -> None:
+        tk.Label(
+            parent, text=text.upper(), font=("DejaVu Sans", 10, "bold"), fg=MUTED, bg=PANEL_BG
+        ).pack(anchor=tk.W, padx=20, pady=(16, 6))
+
+    def _reset_panel(self) -> None:
+        self.latencies = []
+        self._draw_bars({}, None)
+        self.timing_var.set("last decision   –\nembedding      –\nCLM heads      –\naverage        –")
+        self._update_agent("ready")
+        self.log.configure(state=tk.NORMAL)
+        self.log.delete("1.0", tk.END)
+        self.log.configure(state=tk.DISABLED)
+
+    def _write_log(self, text: str, tag: str) -> None:
+        self.log.configure(state=tk.NORMAL)
+        self.log.insert(tk.END, text + "\n", tag)
+        self.log.configure(state=tk.DISABLED)
+        self.log.see(tk.END)
+
+    def _update_agent(self, status: str) -> None:
+        w = self.world
+        self.agent_var.set(
+            f"status    {status}\n"
+            f"position  {w.pos}\n"
+            f"gold      {'in the bag' if w.has_gold else 'not yet'}\n"
+            f"steps     {w.steps}\n"
+            f"score     {w.score}"
+        )
+
+    # --- Drawing ----------------------------------------------------------------------------
+
+    def _cell_box(self, cell: tuple[int, int]) -> tuple[int, int, int, int]:
+        x0 = MARGIN + cell[0] * CELL
+        y0 = MARGIN + (SIZE - 1 - cell[1]) * CELL  # y grows upwards
+        return x0, y0, x0 + CELL, y0 + CELL
+
+    def _draw_board(self) -> None:
+        c, w = self.canvas, self.world
+        c.delete("all")
+        for i in range(SIZE):
+            mid = MARGIN + i * CELL + CELL // 2
+            c.create_text(mid, MARGIN // 2, text=str(i), fill=MUTED, font=FONT)
+            c.create_text(MARGIN // 2, mid, text=str(SIZE - 1 - i), fill=MUTED, font=FONT)
+
+        for x in range(SIZE):
+            for y in range(SIZE):
+                x0, y0, x1, y1 = self._cell_box((x, y))
+                fill = VISITED_BG if (x, y) in self.known else CELL_BG
+                c.create_rectangle(x0 + 2, y0 + 2, x1 - 2, y1 - 2, fill=fill, outline="")
+                if (x, y) == (0, 0):
+                    c.create_text(x0 + 14, y0 + 14, text="START", fill=MUTED, font=("", 8, "bold"))
+                hints = sorted(self.known.get((x, y), frozenset()) - {"glitter"})
+                if hints:
+                    c.create_text(
+                        (x0 + x1) // 2, y1 - 12, text=" · ".join(hints), fill=MUTED, font=("", 9)
+                    )
+
+        for pit in w.pits:
+            cx, cy = self._center(pit)
+            c.create_oval(cx - 34, cy - 34, cx + 34, cy + 34, fill="#05070a", outline="#3a4256")
+            c.create_oval(cx - 20, cy - 20, cx + 20, cy + 20, fill="#000", outline="")
+            c.create_text(cx, cy - 46 + 8, text="PIT", fill=MUTED, font=("", 8, "bold"))
+
+        cx, cy = self._center(w.wumpus)
+        c.create_polygon(
+            cx - 36, cy + 30, cx, cy - 36, cx + 36, cy + 30, fill=DANGER, outline="#ff8a8d", width=2
+        )
+        c.create_text(cx, cy + 8, text="W", fill="white", font=("DejaVu Sans", 22, "bold"))
+
+        if not w.has_gold:
+            cx, cy = self._center(w.gold)
+            c.create_polygon(
+                cx, cy - 40, cx + 40, cy, cx, cy + 40, cx - 40, cy, fill=GOLD, outline="#fff1b8"
+            )
+
+        self._draw_agent()
+
+    def _center(self, cell: tuple[int, int]) -> tuple[int, int]:
+        x0, y0, x1, y1 = self._cell_box(cell)
+        return (x0 + x1) // 2, (y0 + y1) // 2
+
+    def _draw_agent(self) -> None:
+        w, c = self.world, self.canvas
+        cx, cy = self._center(w.pos)
+        color = DANGER if not w.alive else AGENT
+        c.create_oval(cx - 22, cy - 22, cx + 22, cy + 22, fill=color, outline="white", width=2)
+        dx, dy = HEADINGS[w.heading]
+        dy = -dy  # screen y grows downwards
+        c.create_polygon(
+            cx + dx * 22 - dy * 8, cy + dy * 22 + dx * 8,
+            cx + dx * 22 + dy * 8, cy + dy * 22 - dx * 8,
+            cx + dx * 34, cy + dy * 34,
+            fill="white",
+        )  # fmt: skip
+        if w.has_gold:
+            c.create_polygon(
+                cx, cy - 10, cx + 10, cy, cx, cy + 10, cx - 10, cy, fill=GOLD, outline=""
+            )
+
+    def _draw_bars(self, probs: dict[str, float], chosen: str | None) -> None:
+        b = self.bars
+        b.delete("all")
+        width = PANEL_WIDTH - 40
+        names = list(probs) or ["explore", "grab", "leave"]
+        for i, name in enumerate(names):
+            y = 6 + i * 34
+            p = probs.get(name, 0.0)
+            color = ACCENT if name == chosen else BAR
+            b.create_text(0, y + 12, text=name, anchor=tk.W, fill=TEXT, font=FONT)
+            x0, x1 = 80, width - 56
+            b.create_rectangle(x0, y + 2, x1, y + 22, fill=CELL_BG, outline="")
+            b.create_rectangle(x0, y + 2, x0 + (x1 - x0) * p, y + 22, fill=color, outline="")
+            b.create_text(width, y + 12, text=f"{p:.1%}" if probs else "–", anchor=tk.E,
+                          fill=TEXT, font=FONT)  # fmt: skip
+
+    # --- Run control ------------------------------------------------------------------------
+
+    @staticmethod
+    def _copy(world: World) -> World:
+        return dataclasses.replace(world, pits=set(world.pits))
+
+    def start(self) -> None:
+        if self.running:
+            return
+        self.running = True
+        self.button.configure(state=tk.DISABLED, text="Running…")
+        self.world = self._copy(self.initial)
+        self.known = {}
+        self.timer.reset()
+        self._reset_panel()
+        self._draw_board()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _post(self, kind: str, **payload: typing.Any) -> None:
+        self.events.put((kind, payload))
+
+    def _run(self) -> None:
+        try:
+            if self.graph is None:
+                self._post("status", text="loading CLM…")
+                self.graph = build_graph(self._decide, self.timer)
+            world = self._copy(self.initial)
+            state = {"world": world, "known": {}, "situation": "", "log": []}
+            for update in self.graph.stream(state, {"recursion_limit": 200}, stream_mode="updates"):
+                for node, delta in update.items():
+                    self._post("node", node=node, delta=delta, world=self._copy(world))
+                    if node != "observe":  # the decision that follows already pauses
+                        time.sleep(self.delay)
+            self._post("done", world=self._copy(world))
+        except Exception as e:  # shown in the log; the window stays usable
+            self._post("error", message=f"{type(e).__name__}: {e}")
+
+    def _decide(self, text: str, probs: dict[Intent, float]) -> None:
+        """Runs in the worker thread, inside the router."""
+        now = time.perf_counter()
+        started = self.timer.first_call_at or now
+        total, embed = now - started, self.timer.embed_seconds
+        self.timer.reset()
+        self._post(
+            "decision",
+            probs={intent.value: p for intent, p in probs.items()},
+            total=total,
+            embed=embed,
+        )
+        time.sleep(self.delay)
+
+    # --- Event handling (Tk thread) ---------------------------------------------------------
+
+    def _poll(self) -> None:
+        while True:
+            try:
+                kind, payload = self.events.get_nowait()
+            except queue.Empty:
+                break
+            getattr(self, f"_on_{kind}")(**payload)
+        self.root.after(40, self._poll)
+
+    def _on_status(self, text: str) -> None:
+        self._update_agent(text)
+
+    def _on_node(self, node: str, delta: dict[str, typing.Any], world: World) -> None:
+        self.world = world
+        if node == "observe":
+            self.known = delta["known"]
+            self._write_log(f"step {world.steps}: {delta['situation']}", "situation")
+            self._update_agent("observing")
+        else:
+            self._write_log(delta["log"][-1].strip(), "action")
+            self._update_agent(f"running {node}")
+        self._draw_board()
+
+    def _on_decision(self, probs: dict[str, float], total: float, embed: float) -> None:
+        chosen = max(probs, key=probs.__getitem__)
+        self._draw_bars(probs, chosen)
+        self.latencies.append(total)
+        average = sum(self.latencies) / len(self.latencies)
+        self.timing_var.set(
+            f"last decision  {total * 1000:7.0f} ms\n"
+            f"embedding      {embed * 1000:7.0f} ms\n"
+            f"CLM heads      {(total - embed) * 1000:7.0f} ms\n"
+            f"average        {average * 1000:7.0f} ms  ({len(self.latencies)} calls)"
+        )
+        self._write_log(f"CLM → {chosen} ({probs[chosen]:.1%}) in {total * 1000:.0f} ms", "decision")
+
+    def _on_done(self, world: World) -> None:
+        self.world = world
+        outcome = "died" if not world.alive else "escaped" if world.escaped else "out of steps"
+        self._update_agent(outcome)
+        self._write_log(
+            f"\n{outcome.upper()} · gold={world.has_gold} · score={world.score}", "decision"
+        )
+        self._draw_board()
+        self.running = False
+        self.button.configure(state=tk.NORMAL, text="↻  Restart")
+
+    def _on_error(self, message: str) -> None:
+        self._write_log(message, "error")
+        self._update_agent("error")
+        self.running = False
+        self.button.configure(state=tk.NORMAL, text="↻  Retry")
+
+
+def run_gui(world: World, delay: float) -> None:
+    global tk
+    import tkinter as tk  # only needed (and possibly missing) when the GUI is requested
+
+    App(world, delay).root.mainloop()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--random", action="store_true", help="use a random world")
     parser.add_argument("--seed", type=int, help="seed for the random world (implies --random)")
+    parser.add_argument("--gui", action="store_true", help="show a window instead of the terminal")
+    parser.add_argument(
+        "--delay", type=float, default=1.0, help="seconds between steps in the GUI (default 1)"
+    )
     args = parser.parse_args()
 
     if args.random or args.seed is not None:
         world = random_world(random.Random(args.seed))
     else:
         world = classic_world()
+    if args.gui:
+        run_gui(world, args.delay)
+        return
     print(render(world), end="\n\n")
     result = build_graph().invoke(
         {"world": world, "known": {}, "situation": "", "log": []},

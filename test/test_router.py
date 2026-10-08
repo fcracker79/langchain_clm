@@ -118,6 +118,27 @@ def test_action_embeddings_are_computed_once(
     assert provider.calls == [descriptions, ["refund the charge"], ["send an email"]]
 
 
+def test_on_decision_receives_text_and_probabilities(
+    routes: list[Route[Kind]], checkpoint: pathlib.Path
+) -> None:
+    seen: list[tuple[str, dict[Kind, float]]] = []
+    router = create_router(
+        state_selector=lambda s: s["text"],
+        routes=routes,
+        embedding_provider=OneHotProvider(),
+        checkpoint_path=checkpoint,
+        on_decision=lambda text, probs: seen.append((text, probs)),
+    )
+
+    assert router({"text": "send an email"}) == "email_node"
+
+    [(text, probs)] = seen
+    assert text == "send an email"
+    assert set(probs) == set(Kind)
+    assert max(probs, key=probs.__getitem__) == Kind.EMAIL
+    assert sum(probs.values()) == pytest.approx(1.0)
+
+
 def test_works_as_conditional_edge(routes: list[Route[Kind]], checkpoint: pathlib.Path) -> None:
     class State(typing.TypedDict):
         text: str

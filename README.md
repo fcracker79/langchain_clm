@@ -59,7 +59,12 @@ decisions. It needs the llama embedding server running (see above).
 uv run python examples/wumpus.py              # the classic 4x4 world
 uv run python examples/wumpus.py --random     # a random world
 uv run python examples/wumpus.py --seed 7     # a reproducible random world (implies --random)
+uv run python examples/wumpus.py --gui        # a window instead of the terminal (needs tkinter)
 ```
+
+`--gui` shows the board (pits, wumpus, gold, agent), a Start button, and a side panel with what CLM
+answered at each step (the probability of every intent), how long each decision took (embedding
+server vs. CLM heads) and a log. `--delay SECONDS` sets the pause between steps (default 1).
 
 The map is printed first (`S` start, `P` pit, `W` wumpus, `G` gold), then the agent's
 observations and actions, and finally the outcome and score.
